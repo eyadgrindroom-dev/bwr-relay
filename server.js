@@ -1,39 +1,45 @@
-// ============================================================
-//  OOB Avatar Sync Relay  —  server.js
-//  Lightweight Express REST relay.
-//  Stores encrypted peer payloads keyed by (jobId, userId).
-//  Never interprets payload content — pure store-and-forward.
-// ============================================================
-
 "use strict";
 
 const express = require("express");
 const crypto  = require("crypto");
 const app     = express();
 
-app.use(express.json({ limit: "512kb" }));
+// keep raw bytes so the signature is checked against exactly what Roblox sent
+app.use(express.json({
+  limit: "512kb",
+  verify: (req, _res, buf) => { req.rawBody = buf; },
+}));
 
-// ── Config ───────────────────────────────────────────────────
 const SECRET = process.env.RELAY_SECRET;
 if (!SECRET || SECRET.length < 16) {
   console.error("[RELAY] RELAY_SECRET env var missing or too short. Exiting.");
   process.exit(1);
 }
 
-const MAX_AGE_MS    = 10 * 60 * 1000;  // evict entries after 10 minutes
-const TS_WINDOW_MS  = 60  * 1000;      // reject timestamps > 60s old
-const PORT          = process.env.PORT || 3000;
+const MAX_AGE_MS   = 10 * 60 * 1000;
+const TS_WINDOW_MS = 60 * 1000;
+const MAX_JOBS     = 500;
+const MAX_PEERS    = 100;
+const PORT         = process.env.PORT || 3000;
 
-// ── In-memory store ──────────────────────────────────────────
-// Map< jobId, Map< userId, { payload: any, updatedAt: number } > >
-const store = new Map();
+const store = new Map(); // jobId -> Map<userId, { payload, updatedAt }>
 
-function getOrCreateBucket(jobId) {
-  if (!store.has(jobId)) store.set(jobId, new Map());
-  return store.get(jobId);
+function getBucket(jobId, create) {
+  let b = store.get(jobId);
+  if (!b && create) {
+    if (store.size >= MAX_JOBS) return null;
+    b = new Map();
+    store.set(jobId, b);
+  }
+  return b || null;
 }
 
-// Periodic eviction of stale entries (runs every 30 s)
+function putEntry(bucket, uid, payload) {
+  uid = String(uid);
+  if (!bucket.has(uid) && bucket.size >= MAX_PEERS) return;
+  bucket.set(uid, { payload, updatedAt: Date.now() });
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const [jobId, bucket] of store) {
@@ -44,102 +50,108 @@ setInterval(() => {
   }
 }, 30_000);
 
-// ── Authentication middleware ─────────────────────────────────
-// Every request must carry:
-//   x-relay-secret  : the shared secret (RELAY_SECRET env var)
-//   x-timestamp     : Unix milliseconds (current time on sender)
-//
-// Constant-time comparison prevents timing attacks.
-// Timestamp window prevents replay attacks.
-function authenticate(req, res, next) {
-  const provided  = req.headers["x-relay-secret"]  || "";
-  const tsHeader  = req.headers["x-timestamp"]     || "0";
+const sha = (s) => crypto.createHash("sha256").update(String(s)).digest();
+const safeEqual = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
 
-  // Timestamp check — both sides use Unix ms
-  const ts  = parseInt(tsHeader, 10);
-  const now = Date.now();
-  if (isNaN(ts) || Math.abs(now - ts) > TS_WINDOW_MS) {
+function authenticate(req, res, next) {
+  const ts  = parseInt(req.headers["x-timestamp"] || "0", 10);
+  if (isNaN(ts) || Math.abs(Date.now() - ts) > TS_WINDOW_MS) {
     return res.status(401).json({ error: "Timestamp rejected" });
   }
-
-  // Constant-time secret comparison
-  // Pad both strings to the same length before comparing
-  const padLen = Math.max(provided.length, SECRET.length, 1);
-  try {
-    const a = Buffer.alloc(padLen, 0);
-    const b = Buffer.alloc(padLen, 0);
-    a.write(provided);
-    b.write(SECRET);
-    if (!crypto.timingSafeEqual(a, b)) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-  } catch {
+  if (!safeEqual(req.headers["x-relay-secret"] || "", SECRET)) {
     return res.status(401).json({ error: "Unauthorized" });
   }
-
   next();
 }
 
-// ── Routes ───────────────────────────────────────────────────
+// Must match hmacSign() in OOB_SyncHandler exactly.
+function fnv(bytes, start) {
+  let h = start >>> 0;
+  for (const b of bytes) h = Math.imul(h ^ b, 16777619) >>> 0;
+  return h;
+}
+const hex8 = (n) => (n >>> 0).toString(16).padStart(8, "0");
 
-// POST /api/v1/sync/push
-// Body: { jobId: string, userId: string, payload: any }
-// Stores this player's current payload for other peers to pull.
-app.post("/api/v1/sync/push", authenticate, (req, res) => {
-  const { jobId, userId, payload } = req.body;
+function expectedSignature(rawBuf, ts) {
+  let seed = fnv(Buffer.from(SECRET, "utf8"), 0);
+  seed = (seed ^ (Number(ts) % 4294967296)) >>> 0;
+  const hash = fnv(Buffer.concat([rawBuf, Buffer.from(String(ts), "utf8")]), seed);
+  return hex8(hash) + hex8(hash ^ seed);
+}
+
+function verifySignature(req, res, next) {
+  const sig = String(req.headers["x-signature"] || "");
+  const ts  = String(req.headers["x-timestamp"] || "");
+  const raw = req.rawBody || Buffer.alloc(0);
+  if (!sig || !safeEqual(sig, expectedSignature(raw, ts))) {
+    return res.status(403).json({ error: "invalid signature" });
+  }
+  next();
+}
+
+// Single combined call: store everyone's payloads, drop leavers, return all peers.
+app.post("/api/v1/sync/exchange", authenticate, verifySignature, (req, res) => {
+  const { jobId, entries, remove } = req.body || {};
+  if (!jobId) return res.status(400).json({ error: "Missing jobId" });
+
+  const bucket = getBucket(String(jobId), true);
+  if (!bucket) return res.status(503).json({ error: "Relay full" });
+
+  if (Array.isArray(remove)) {
+    for (const uid of remove) bucket.delete(String(uid));
+  }
+  if (entries && typeof entries === "object" && !Array.isArray(entries)) {
+    for (const [uid, payload] of Object.entries(entries)) {
+      if (payload !== undefined) putEntry(bucket, uid, payload);
+    }
+  }
+
+  const peers = {};
+  for (const [uid, entry] of bucket) peers[uid] = entry.payload;
+  res.json({ peers });
+});
+
+// Legacy routes, kept so nothing else breaks.
+app.post("/api/v1/sync/push", authenticate, verifySignature, (req, res) => {
+  const { jobId, userId, payload } = req.body || {};
   if (!jobId || !userId || payload === undefined) {
     return res.status(400).json({ error: "Missing: jobId, userId, or payload" });
   }
-
-  getOrCreateBucket(String(jobId))
-    .set(String(userId), { payload, updatedAt: Date.now() });
-
+  const bucket = getBucket(String(jobId), true);
+  if (!bucket) return res.status(503).json({ error: "Relay full" });
+  putEntry(bucket, userId, payload);
   res.json({ ok: true });
 });
 
-// GET /api/v1/sync/pull?jobId=X&requesterId=Y
-// Returns all peers EXCEPT the requester.
-// The Roblox server uses requesterId = "server" so it gets ALL users.
 app.get("/api/v1/sync/pull", authenticate, (req, res) => {
   const { jobId, requesterId } = req.query;
   if (!jobId || !requesterId) {
     return res.status(400).json({ error: "Missing: jobId or requesterId" });
   }
-
-  const bucket = store.get(String(jobId));
-  if (!bucket) return res.json({ peers: {} });
-
+  const bucket = getBucket(String(jobId), false);
   const peers = {};
-  for (const [uid, entry] of bucket) {
-    if (uid !== String(requesterId)) {
-      peers[uid] = entry.payload;
+  if (bucket) {
+    for (const [uid, entry] of bucket) {
+      if (uid !== String(requesterId)) peers[uid] = entry.payload;
     }
   }
-
   res.json({ peers });
 });
 
-// DELETE /api/v1/sync/clear
-// Body: { jobId: string, userId: string }
-// Called when a player leaves the Roblox server.
 app.delete("/api/v1/sync/clear", authenticate, (req, res) => {
   const { jobId, userId } = req.body || {};
-  if (jobId && userId) {
-    const bucket = store.get(String(jobId));
-    if (bucket) {
-      bucket.delete(String(userId));
-      if (!bucket.size) store.delete(String(jobId));
-    }
+  const bucket = jobId && getBucket(String(jobId), false);
+  if (bucket && userId) {
+    bucket.delete(String(userId));
+    if (!bucket.size) store.delete(String(jobId));
   }
   res.json({ ok: true });
 });
 
-// GET /health  — simple uptime check for Railway/Render
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, ts: Date.now(), entries: store.size });
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
+app.use((err, _req, res, _next) => {
+  res.status(400).json({ error: "Bad request" });
 });
 
-// ── Start ────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`[RELAY] OOB Avatar Sync Relay running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`[RELAY] running on port ${PORT}`));
